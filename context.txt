@@ -1,0 +1,37 @@
+The goal of this project is to build ultra efficient micropython code for the
+BiomeLX greenhouse project.
+
+The code runs on a RasPi Zero (soon to be W) and allows function of the follwing
+components:
+
+2 servos that must always operate simultaneously located on pins GP14 and GP15.
+These servos open and close the canopy of the greenhouse.
+
+A waveshare 2.13" eink display oriented in portrait mode. The pinout is as follows:
+
+VCC         Pin 36	3V3(OUT) (3.3V Power)
+GND         Pin 38 (or any GND)	GND (Ground)
+DIN         Pin 25	GP19 (SPI0 TX)
+CLK         Pin 24	GP18 (SPI0 SCK)
+CS          Pin 22	GP17 (SPI0 CSn)
+DC          Pin 21	GP16 (Standard GPIO)
+RST         Pin 17	GP13 (Standard GPIO)
+BUSY        Pin 16	GP12 (Standard GPIO)
+
+The eink display should show:
+- Current external and internal temperature, humidity, and pressure (adding later)
+- Current battery level/current (adding batt monitoring later)
+- Current solar input level/current (adding solar monitoring later)
+- Current weather (pull from web later)
+- Current state of system (closed or open)
+
+Two BME280 sensors will monitor external and internal temperature
+
+A INA3221 Triple-Channel Shunt Current Voltage Monitor Sensor will measure voltage
+and current between battery and between solar cells
+
+
+Efficiency:
+
+The system should go into a deep sleep and wake up every 5 minutes to update the eink display
+based on all sensor reading.
