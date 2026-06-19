@@ -40,7 +40,8 @@ Configured in `.mpyFiles/config.py`:
 
 - Servos: GP14, GP15
 - E-ink SPI0: SCK=GP18, MOSI=GP19, CS=GP17, DC=GP16, RST=GP13, BUSY=GP12
-- I2C1 default: SDA=GP26, SCL=GP27 (update if your wiring differs)
+- BME280 bus (I2C1 default): SDA=GP26, SCL=GP27
+- INA3221 bus (I2C0 default): SDA=GP0, SCL=GP1
 
 Default I2C addresses:
 

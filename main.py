@@ -40,12 +40,6 @@ except ImportError:
     except ImportError:
         requests = None
 
-# Keep a single import style by making src/ discoverable when running from tools/repl.
-if "src" not in sys.path:
-    sys.path.append("src")
-if "/src" not in sys.path:
-    sys.path.append("/src")
-
 import config
 from lib.drivers.bme280 import BME280
 from lib.drivers.dual_servo import DualServo

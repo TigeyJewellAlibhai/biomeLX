@@ -1,1 +1,4 @@
-# Keep boot.py minimal to reduce wake overhead.
+"""Minimal source boot placeholder.
+
+Startup is handled by root main.py.
+"""

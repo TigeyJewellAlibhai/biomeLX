@@ -30,8 +30,59 @@ Two BME280 sensors will monitor external and internal temperature
 A INA3221 Triple-Channel Shunt Current Voltage Monitor Sensor will measure voltage
 and current between battery and between solar cells
 
+Two switches (one side ground, one side signal) on GP8 and GP9 that should have pullup set
+to correctly detect presses
+
 
 Efficiency:
 
-The system should go into a deep sleep and wake up every 5 minutes to update the eink display
-based on all sensor reading.
+The system should go into a deep sleep and wake up every 10 minutes to update the eink display
+based on all sensor reading. It also turns on wifi and attempts to connect to the specified wifi
+network. If successful, it updates its time from the web along with weather info. If it can't get new
+time info it keeps time using internal (so this is most useful after a reboot)
+ All sensor readings should be recorded to a log file (csv is fine)
+
+A new csv is created every reboot but only 4 csvs exist maximum (so oldest gets overwritten)
+.
+In addition, pressing either of the buttons should wake up the mcu from
+deep sleep. The buttons should also do the following:
+
+Button 1 toggles wireless mode. When pressed, the pi doesn't enter deep sleep, and connects to the specified wifi
+network.
+Button 2 opens or closes the system with the servos
+
+In servo case, when a button is pressed, the screen displays what the button is doing in large text across the screen
+ (opening or closing) and then reverts to the UI after 5 seconds
+
+In wifi case, when in wifi on (debug mode) the screen displays the wifi status (connecting or connected) and the IP address.
+If it can't connect to the specified network within 30 seconds, it creates an access point.
+
+In either case, it hosts a web server with a simple UI that allows you to edit the contents of the config.py file
+(any variable is exposed to editing) and then a button that performs a hard reset
+
+There is also an option to download any of the log files
+
+If 1 minute has passed without button presses (and not in wifi mode), the mcu goes back to deep sleep
+
+
+UI:
+
+At the top in large text is BiomeLX with a smaller open or closed next to internal
+
+Two boxes next to each other horizontally say Internal and External at the top, and then the
+temperature in large text, then humidity, then pressure below and in smaller text
+
+Another box spanning the width shows xx.xV and batt underneath in smaller text, and xx.xV and 
+solar underneath in smaller text
+
+Finally, bottom box shows current weather on the left:
+
+(time hh:mm)
+(dawn/day/dusk/night)
+(sun %)
+(rain %)
+(rain 3h %)
+
+And on the right:
+(wifi icon if connected to wifi)
+(battery icon if normal or battery with + if in power saver)
