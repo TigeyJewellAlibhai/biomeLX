@@ -50,7 +50,7 @@ SLEEP_POLL_MS = 1_000
 
 # Servo positions.
 SERVO_CLOSED_ANGLE = 270
-SERVO_OPEN_ANGLE = 0
+SERVO_OPEN_ANGLE = 40
 # Motion mode: "ramped" (default) or "simple" (direct set_angle).
 SERVO_MOTION_MODE = "ramped"
 SERVO_MOVE_TOTAL_MS = 8_000
@@ -70,6 +70,17 @@ SERVO_SPAN_DEG = 270
 # Servo pins.
 SERVO_PIN_A = 14
 SERVO_PIN_B = 15
+# Persist canopy state so boot restores last known position.
+SERVO_STATE_FILE = "canopy_state.txt"
+# Used only if state file is missing or unreadable.
+SERVO_DEFAULT_OPEN = False
+# Automatic daily open/close schedule (local time, HH:MM).
+CANOPY_SCHEDULE_ENABLED = False
+CANOPY_OPEN_TIME_HM = "07:00"
+CANOPY_CLOSE_TIME_HM = "20:00"
+# Optional rain override: close canopy whenever rain percentage is high.
+CANOPY_RAIN_OVERRIDE_ENABLED = False
+CANOPY_RAIN_CLOSE_PCT = 70
 
 # E-ink pins (Waveshare 2.13in, SPI0).
 EPD_SPI_ID = 0
@@ -133,6 +144,10 @@ ENABLE_WEB_TIME_SYNC = True
 NTP_HOST = "pool.ntp.org"
 # Local offset from UTC in hours. Example: -4 for EDT, -5 for EST.
 TIMEZONE_OFFSET_HOURS = -4
+TIME_SYNC_NTP_RETRIES = 3
+TIME_HTTP_FALLBACK_ENABLED = True
+TIME_HTTP_FALLBACK_URL = "http://worldtimeapi.org/api/timezone/Etc/UTC"
+TIME_SYNC_MIN_VALID_YEAR = 2024
 
 # CSV logging.
 LOG_ENABLED = True
@@ -146,6 +161,11 @@ WEATHER_LONGITUDE = -71.16
 
 # Forecast look-ahead window used for rain-soon indicator.
 WEATHER_RAIN_SOON_HOURS = 3
+# Weather API endpoint and reliability knobs for constrained network stacks.
+WEATHER_API_BASE_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_ALLOW_HTTP_FALLBACK = True
+WIFI_PULL_CONNECT_RETRIES = 2
+WIFI_PULL_RESET_RADIO = True
 
 # Sensor sampling: collect readings for this duration on wake, then average.
 SENSOR_SAMPLE_WINDOW_MS = 1_000

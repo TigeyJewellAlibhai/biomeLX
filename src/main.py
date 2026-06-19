@@ -65,7 +65,8 @@ _wireless_mode = False
 _web_server = None
 _web_server_port = None
 _log_path = None
-_startup_open_applied = False
+_servo_rail_pin = None
+_servo_rail_init_failed = False
 
 _REQUIRED_CONFIG_DEFAULTS = {
     "BME280_INTERNAL_ADDR": 0x77,
@@ -79,6 +80,21 @@ _REQUIRED_CONFIG_DEFAULTS = {
     "SERVO_MIN_PULSE_US": 1000,
     "SERVO_MAX_PULSE_US": 2000,
     "SERVO_SPAN_DEG": 180,
+    "SERVO_STATE_FILE": "canopy_state.txt",
+    "SERVO_DEFAULT_OPEN": False,
+    "CANOPY_SCHEDULE_ENABLED": False,
+    "CANOPY_OPEN_TIME_HM": "07:00",
+    "CANOPY_CLOSE_TIME_HM": "20:00",
+    "CANOPY_RAIN_OVERRIDE_ENABLED": False,
+    "CANOPY_RAIN_CLOSE_PCT": 70,
+    "TIME_SYNC_NTP_RETRIES": 3,
+    "TIME_HTTP_FALLBACK_ENABLED": True,
+    "TIME_HTTP_FALLBACK_URL": "http://worldtimeapi.org/api/timezone/Etc/UTC",
+    "TIME_SYNC_MIN_VALID_YEAR": 2024,
+    "SERVO_RAIL_ENABLE_PIN": 2,
+    "SERVO_RAIL_ACTIVE_HIGH": True,
+    "SERVO_RAIL_SETTLE_MS": 80,
+    "SERVO_RAIL_OFF_DELAY_MS": 80,
     "EPD_PIN_SCK": 18,
     "EPD_PIN_MOSI": 19,
     "EPD_PIN_CS": 17,
@@ -238,6 +254,107 @@ def _append_log_row(payload):
             )
     except Exception as exc:
         _dbg("Log append failed: {}".format(exc))
+
+
+def _load_canopy_state():
+    default_open = bool(getattr(config, "SERVO_DEFAULT_OPEN", False))
+    path = str(getattr(config, "SERVO_STATE_FILE", "canopy_state.txt"))
+    try:
+        with open(path, "r") as fh:
+            raw = fh.read().strip().lower()
+        if raw in ("open", "1", "true"):
+            return True
+        if raw in ("closed", "0", "false"):
+            return False
+    except Exception:
+        pass
+    return default_open
+
+
+def _save_canopy_state(is_open):
+    path = str(getattr(config, "SERVO_STATE_FILE", "canopy_state.txt"))
+    tmp_path = path + ".tmp"
+    text = "open\n" if is_open else "closed\n"
+    try:
+        with open(tmp_path, "w") as fh:
+            fh.write(text)
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        os.rename(tmp_path, path)
+        return True
+    except Exception as exc:
+        _dbg("Failed to persist canopy state: {}".format(exc))
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
+def _parse_hm_to_minutes(text):
+    try:
+        value = str(text).strip()
+        parts = value.split(":")
+        if len(parts) != 2:
+            return None
+        hour = int(parts[0])
+        minute = int(parts[1])
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            return None
+        return (hour * 60) + minute
+    except Exception:
+        return None
+
+
+def _is_canopy_scheduled_open_now():
+    open_min = _parse_hm_to_minutes(getattr(config, "CANOPY_OPEN_TIME_HM", "07:00"))
+    close_min = _parse_hm_to_minutes(getattr(config, "CANOPY_CLOSE_TIME_HM", "20:00"))
+    if open_min is None or close_min is None:
+        return None
+
+    now = time.localtime()
+    now_min = (int(now[3]) * 60) + int(now[4])
+
+    if open_min == close_min:
+        return False
+    if open_min < close_min:
+        return open_min <= now_min < close_min
+    return (now_min >= open_min) or (now_min < close_min)
+
+
+def _effective_rain_pct(rain_now_pct, rain_3h_pct):
+    vals = []
+    if isinstance(rain_now_pct, (int, float)):
+        vals.append(float(rain_now_pct))
+    if isinstance(rain_3h_pct, (int, float)):
+        vals.append(float(rain_3h_pct))
+    if not vals:
+        return None
+    return max(vals)
+
+
+def _apply_canopy_rules(rain_now_pct, rain_3h_pct):
+    desired_open = _canopy_open
+
+    if bool(getattr(config, "CANOPY_SCHEDULE_ENABLED", False)):
+        scheduled_open = _is_canopy_scheduled_open_now()
+        if scheduled_open is not None:
+            desired_open = scheduled_open
+
+    if bool(getattr(config, "CANOPY_RAIN_OVERRIDE_ENABLED", False)):
+        rain_threshold = int(getattr(config, "CANOPY_RAIN_CLOSE_PCT", 70))
+        if rain_threshold < 0:
+            rain_threshold = 0
+        elif rain_threshold > 100:
+            rain_threshold = 100
+
+        effective_rain = _effective_rain_pct(rain_now_pct, rain_3h_pct)
+        if effective_rain is not None and effective_rain >= rain_threshold:
+            desired_open = False
+
+    return desired_open
 
 
 def _url_decode(text):
@@ -402,6 +519,21 @@ def _load_config_vars():
         if key and key.upper() == key and _is_config_symbol_key(key) and _is_web_editable_config_key(key):
             vars_map[key] = right.strip()
 
+    # Show newer web-editable defaults even if config.py is from an older build.
+    for key in _REQUIRED_CONFIG_DEFAULTS:
+        if _is_web_editable_config_key(key) and key not in vars_map:
+            vars_map[key] = repr(getattr(config, key))
+
+    for key in (
+        "CANOPY_SCHEDULE_ENABLED",
+        "CANOPY_OPEN_TIME_HM",
+        "CANOPY_CLOSE_TIME_HM",
+        "CANOPY_RAIN_OVERRIDE_ENABLED",
+        "CANOPY_RAIN_CLOSE_PCT",
+    ):
+        if key not in vars_map and hasattr(config, key):
+            vars_map[key] = repr(getattr(config, key))
+
     return path, lines, vars_map
 
 
@@ -440,18 +572,27 @@ def _save_config_vars(updated_values):
 
     changed = False
     change_count = 0
+    found_keys = set()
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
         left, _right = stripped.split("=", 1)
         key = left.strip()
+        found_keys.add(key)
         if key in updated_values:
             new_line = "{} = {}\n".format(key, updated_values[key])
             if lines[idx] != new_line:
                 lines[idx] = new_line
                 changed = True
                 change_count += 1
+
+    # Append keys that did not exist in older config files.
+    for key in updated_values:
+        if key not in found_keys:
+            lines.append("{} = {}\n".format(key, updated_values[key]))
+            changed = True
+            change_count += 1
 
     if not changed:
         return False, 0
@@ -563,6 +704,98 @@ def _servo_move_params():
         breakaway_hold_ms = 500
 
     return total_ms, step_ms, ramp, min_step_deg, breakaway_deg, breakaway_hold_ms
+
+
+def _set_servo_rail(enabled):
+    global _servo_rail_pin, _servo_rail_init_failed
+
+    if _servo_rail_pin is None and (not _servo_rail_init_failed):
+        pin_id = int(getattr(config, "SERVO_RAIL_ENABLE_PIN", 2))
+        try:
+            _servo_rail_pin = machine.Pin(pin_id, machine.Pin.OUT)
+        except Exception as exc:
+            _dbg("Servo rail pin init failed: {}".format(exc))
+            _servo_rail_init_failed = True
+
+    if _servo_rail_pin is None:
+        return False
+
+    active_high = bool(getattr(config, "SERVO_RAIL_ACTIVE_HIGH", True))
+    level = 1 if (enabled == active_high) else 0
+    try:
+        _servo_rail_pin.value(level)
+        return True
+    except Exception as exc:
+        _dbg("Servo rail set failed: {}".format(exc))
+        return False
+
+
+def _move_servo_with_power(servo, target, motion_mode):
+    settle_ms = int(getattr(config, "SERVO_RAIL_SETTLE_MS", 80))
+    off_delay_ms = int(getattr(config, "SERVO_RAIL_OFF_DELAY_MS", 80))
+    if settle_ms < 0:
+        settle_ms = 0
+    if off_delay_ms < 0:
+        off_delay_ms = 0
+
+    _set_servo_rail(True)
+    if settle_ms:
+        time.sleep_ms(settle_ms)
+
+    try:
+        (
+            move_total_ms,
+            move_step_ms,
+            move_ramp,
+            move_min_step_deg,
+            move_breakaway_deg,
+            move_breakaway_hold_ms,
+        ) = _servo_move_params()
+
+        if motion_mode == "simple":
+            _dbg("Servo simple move target={}".format(target))
+            servo.set_angle(target)
+        else:
+            _dbg(
+                "Servo move start target={} total={}ms step={}ms ramp={} min_step={} breakaway={} hold={}ms".format(
+                    target,
+                    move_total_ms,
+                    move_step_ms,
+                    move_ramp,
+                    move_min_step_deg,
+                    move_breakaway_deg,
+                    move_breakaway_hold_ms,
+                )
+            )
+            servo.move_angle(
+                target,
+                total_ms=move_total_ms,
+                step_ms=move_step_ms,
+                ramp_strength=move_ramp,
+                min_step_deg=move_min_step_deg,
+                breakaway_deg=move_breakaway_deg,
+                breakaway_hold_ms=move_breakaway_hold_ms,
+            )
+    finally:
+        if off_delay_ms:
+            time.sleep_ms(off_delay_ms)
+        _set_servo_rail(False)
+
+
+def _set_canopy_state(servo, should_open, force=False, motion_mode=None):
+    global _canopy_open
+
+    if (not force) and (_canopy_open == bool(should_open)):
+        return False
+
+    if motion_mode is None:
+        motion_mode = str(getattr(config, "SERVO_MOTION_MODE", "ramped")).strip().lower()
+
+    target = getattr(config, "SERVO_OPEN_ANGLE", 90) if should_open else getattr(config, "SERVO_CLOSED_ANGLE", 0)
+    _move_servo_with_power(servo, target, motion_mode)
+    _canopy_open = bool(should_open)
+    _save_canopy_state(_canopy_open)
+    return True
 
 
 def _safe_epd_draw(epd, draw_func, *args):
@@ -709,32 +942,84 @@ def _wifi_disable_all():
 def _sync_time_from_web():
     if not bool(getattr(config, "ENABLE_WEB_TIME_SYNC", True)):
         return False
-    if ntptime is None:
-        _dbg("ntptime unavailable")
-        return False
     if not _wifi_is_connected():
         return False
 
-    try:
-        ntptime.host = str(getattr(config, "NTP_HOST", "pool.ntp.org"))
-    except Exception:
-        pass
-
-    try:
-        ntptime.settime()
-
-        offset_hours = int(getattr(config, "TIMEZONE_OFFSET_HOURS", 0))
-        if offset_hours:
-            now_epoch = time.time() + (offset_hours * 3600)
-            lt = time.localtime(now_epoch)
+    def _set_local_time_from_epoch(epoch_utc):
+        try:
+            offset_hours = int(getattr(config, "TIMEZONE_OFFSET_HOURS", 0))
+            lt = time.localtime(int(epoch_utc) + (offset_hours * 3600))
             rtc = machine.RTC()
             rtc.datetime((lt[0], lt[1], lt[2], lt[6], lt[3], lt[4], lt[5], 0))
+            return True
+        except Exception as exc:
+            _dbg("RTC set failed: {}".format(exc))
+            return False
 
-        _dbg("Time synchronized from web")
-        return True
-    except Exception as exc:
-        _dbg("Time sync failed: {}".format(exc))
-        return False
+    def _sync_time_from_http_fallback():
+        if requests is None:
+            return False
+        url = str(getattr(config, "TIME_HTTP_FALLBACK_URL", "http://worldtimeapi.org/api/timezone/Etc/UTC"))
+        response = None
+        try:
+            response = requests.get(url)
+            status_code = getattr(response, "status_code", 200)
+            if status_code != 200:
+                _dbg("HTTP time status {}".format(status_code))
+                return False
+            data = response.json()
+            if not isinstance(data, dict):
+                return False
+            epoch_utc = data.get("unixtime")
+            if not isinstance(epoch_utc, (int, float)):
+                _dbg("HTTP time missing unixtime")
+                return False
+            if _set_local_time_from_epoch(epoch_utc):
+                _dbg("Time synchronized from HTTP fallback")
+                return True
+            return False
+        except Exception as exc:
+            _dbg("HTTP time sync failed: {}".format(exc))
+            return False
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    min_valid_year = int(getattr(config, "TIME_SYNC_MIN_VALID_YEAR", 2024))
+    retries = int(getattr(config, "TIME_SYNC_NTP_RETRIES", 3))
+    if retries < 1:
+        retries = 1
+    elif retries > 5:
+        retries = 5
+
+    if ntptime is not None:
+        try:
+            ntptime.host = str(getattr(config, "NTP_HOST", "pool.ntp.org"))
+        except Exception:
+            pass
+
+        for attempt in range(retries):
+            try:
+                ntptime.settime()
+                if _set_local_time_from_epoch(time.time()):
+                    if time.localtime()[0] >= min_valid_year:
+                        _dbg("Time synchronized from NTP")
+                        return True
+            except Exception as exc:
+                _dbg("NTP sync attempt {}/{} failed: {}".format(attempt + 1, retries, exc))
+            time.sleep_ms(150)
+    else:
+        _dbg("ntptime unavailable")
+
+    if bool(getattr(config, "TIME_HTTP_FALLBACK_ENABLED", True)):
+        if _sync_time_from_http_fallback() and time.localtime()[0] >= min_valid_year:
+            return True
+
+    _dbg("Time sync failed; keeping local RTC")
+    return False
 
 
 def _http_send(client, status, content_type, body, extra_headers=None):
@@ -809,6 +1094,8 @@ def _render_web_index(message=""):
             return "Power + Wake"
         if key.startswith("BME_") or key.startswith("INA_") or key.startswith("I2C_") or key.startswith("SENSOR_"):
             return "Sensors + Sampling"
+        if key.startswith("CANOPY_"):
+            return "Servo"
         if key.startswith("SERVO_"):
             return "Servo"
         return "System"
@@ -1267,8 +1554,26 @@ def _read_weather():
         _dbg("WEATHER_LATITUDE/WEATHER_LONGITUDE not set")
         return None
 
-    wlan = _wifi_connect()
+    connect_retries = int(getattr(config, "WIFI_PULL_CONNECT_RETRIES", 2))
+    if connect_retries < 1:
+        connect_retries = 1
+    if connect_retries > 4:
+        connect_retries = 4
+
+    if (not _wireless_mode) and bool(getattr(config, "WIFI_PULL_RESET_RADIO", True)):
+        _wifi_disable_all()
+        time.sleep_ms(200)
+
+    wlan = None
+    for attempt in range(connect_retries):
+        wlan = _wifi_connect()
+        if wlan is not None:
+            break
+        _dbg("weather Wi-Fi connect retry {}/{}".format(attempt + 1, connect_retries))
+        time.sleep_ms(300)
+
     if wlan is None:
+        _dbg("weather skipped: Wi-Fi unavailable")
         return None
     _sync_time_from_web()
 
@@ -1280,18 +1585,39 @@ def _read_weather():
 
     rain_3h_hours = 3
 
+    base_url = str(getattr(config, "WEATHER_API_BASE_URL", "https://api.open-meteo.com/v1/forecast"))
     url = (
-        "https://api.open-meteo.com/v1/forecast"
+        "{base}"
         "?latitude={lat}&longitude={lon}"
         "&current=cloud_cover,precipitation,rain,weather_code"
         "&hourly=precipitation_probability"
         "&forecast_hours={hours}"
         "&timezone=auto"
-    ).format(lat=lat, lon=lon, hours=max(rain_soon_hours, rain_3h_hours))
+    ).format(base=base_url, lat=lat, lon=lon, hours=max(rain_soon_hours, rain_3h_hours))
 
     response = None
     try:
-        response = requests.get(url)
+        try_urls = [url]
+        if bool(getattr(config, "WEATHER_ALLOW_HTTP_FALLBACK", True)) and url.startswith("https://"):
+            try_urls.append("http://" + url[len("https://"):])
+
+        response = None
+        last_error = None
+        for try_url in try_urls:
+            try:
+                response = requests.get(try_url)
+                if try_url != url:
+                    _dbg("weather fetched via HTTP fallback")
+                break
+            except Exception as exc:
+                last_error = exc
+                response = None
+
+        if response is None:
+            if last_error is not None:
+                raise last_error
+            return None
+
         status_code = getattr(response, "status_code", 200)
         if status_code != 200:
             _dbg("weather HTTP status {}".format(status_code))
@@ -1753,15 +2079,12 @@ def _draw_wireless_status(epd):
 
 
 def run_once():
-    global _power_saver_mode, _canopy_open, _swallow_wake_button_press, _last_wake_reason, _wireless_mode, _startup_open_applied
+    global _power_saver_mode, _canopy_open, _swallow_wake_button_press, _last_wake_reason, _wireless_mode
 
     _dbg("run_once start")
     _recover_config_from_backup_if_needed()
     _ensure_config_defaults_loaded()
-
-    if not _startup_open_applied:
-        _canopy_open = True
-        _startup_open_applied = True
+    _canopy_open = _load_canopy_state()
 
     bme_i2c_id = getattr(config, "BME_I2C_ID", getattr(config, "I2C_ID", 1))
     bme_i2c_scl = getattr(config, "BME_I2C_PIN_SCL", getattr(config, "I2C_PIN_SCL", 27))
@@ -1861,8 +2184,7 @@ def run_once():
         max_us=int(getattr(config, "SERVO_MAX_PULSE_US", 2000)),
         span_deg=int(getattr(config, "SERVO_SPAN_DEG", 180)),
     )
-    canopy_state = "open" if _canopy_open else "closed"
-    servo.set_angle(getattr(config, "SERVO_OPEN_ANGLE", 90) if _canopy_open else getattr(config, "SERVO_CLOSED_ANGLE", 0))
+    _set_servo_rail(False)
 
     epd = _safe_epd()
     wake_refresh_mode = _resolve_refresh_mode("full" if _last_wake_reason == "timer" else "quick")
@@ -1927,6 +2249,10 @@ def run_once():
         weather_sun_pct = weather.get("sun_pct")
         weather_rain_pct = weather.get("rain_now_pct")
         weather_rain_3h_pct = weather.get("rain_3h_pct")
+
+    desired_open = _apply_canopy_rules(weather_rain_pct, weather_rain_3h_pct)
+    _set_canopy_state(servo, desired_open, force=True, motion_mode="simple")
+    canopy_state = "open" if _canopy_open else "closed"
 
     payload = {
         "state": canopy_state,
@@ -2046,46 +2372,13 @@ def run_once():
         if servo_edge and time.ticks_diff(now, last_servo_press) >= debounce_ms:
             last_servo_press = now
             last_activity = now
-            _canopy_open = not _canopy_open
+            next_open = not _canopy_open
+            if epd is not None:
+                msg = "OPENING" if next_open else "CLOSING"
+                epd = _safe_epd_draw(epd, draw_action_message, msg, "", _resolve_refresh_mode("quick"))
+            _set_canopy_state(servo, next_open, force=False)
             canopy_state = "open" if _canopy_open else "closed"
             payload["state"] = canopy_state
-            if epd is not None:
-                msg = "OPENING" if _canopy_open else "CLOSING"
-                epd = _safe_epd_draw(epd, draw_action_message, msg, "", _resolve_refresh_mode("quick"))
-            target = getattr(config, "SERVO_OPEN_ANGLE", 90) if _canopy_open else getattr(config, "SERVO_CLOSED_ANGLE", 0)
-            motion_mode = str(getattr(config, "SERVO_MOTION_MODE", "ramped")).strip().lower()
-            (
-                move_total_ms,
-                move_step_ms,
-                move_ramp,
-                move_min_step_deg,
-                move_breakaway_deg,
-                move_breakaway_hold_ms,
-            ) = _servo_move_params()
-            if motion_mode == "simple":
-                _dbg("Servo simple move target={}".format(target))
-                servo.set_angle(target)
-            else:
-                _dbg(
-                    "Servo move start target={} total={}ms step={}ms ramp={} min_step={} breakaway={} hold={}ms".format(
-                        target,
-                        move_total_ms,
-                        move_step_ms,
-                        move_ramp,
-                        move_min_step_deg,
-                        move_breakaway_deg,
-                        move_breakaway_hold_ms,
-                    )
-                )
-                servo.move_angle(
-                    target,
-                    total_ms=move_total_ms,
-                    step_ms=move_step_ms,
-                    ramp_strength=move_ramp,
-                    min_step_deg=move_min_step_deg,
-                    breakaway_deg=move_breakaway_deg,
-                    breakaway_hold_ms=move_breakaway_hold_ms,
-                )
             _dbg("Servo move complete")
 
             # E-ink refresh only after movement is fully complete.
