@@ -40,23 +40,19 @@ except ImportError:
     except ImportError:
         requests = None
 
-# Keep a single import style by making src/ discoverable when running from tools/repl.
-if "src" not in sys.path:
-    sys.path.append("src")
-if "/src" not in sys.path:
-    sys.path.append("/src")
-
 import config
-from lib.drivers.bme280 import BME280
-from lib.drivers.dual_servo import DualServo
-from lib.drivers.epd_2in13_v2 import EPD2in13V2
-from lib.drivers.ina3221 import INA3221
-from lib.ui.status_screen import draw_action_message, draw_status, draw_wifi_mode
+
+BME280 = None
+DualServo = None
+EPD2in13V2 = None
+INA3221 = None
+draw_action_message = None
+draw_status = None
+draw_wifi_mode = None
 
 
 _epd_failed_once = False
 _epd_cached = None
-_power_saver_mode = False
 _canopy_open = False
 _swallow_wake_button_press = False
 _button_wake_flag = False
@@ -67,6 +63,8 @@ _web_server_port = None
 _log_path = None
 _servo_rail_pin = None
 _servo_rail_init_failed = False
+_wifi_last_fail_ms = None
+_wifi_stack_info_logged = False
 
 _REQUIRED_CONFIG_DEFAULTS = {
     "BME280_INTERNAL_ADDR": 0x77,
@@ -131,6 +129,33 @@ def _web_log(msg):
         print("[WEB] {}".format(msg))
 
 
+def _lazy_import_runtime_modules():
+    global BME280, DualServo, EPD2in13V2, INA3221
+    global draw_action_message, draw_status, draw_wifi_mode
+
+    if BME280 is None:
+        from lib.drivers.bme280 import BME280 as _BME280
+        BME280 = _BME280
+    if DualServo is None:
+        from lib.drivers.dual_servo import DualServo as _DualServo
+        DualServo = _DualServo
+    if EPD2in13V2 is None:
+        from lib.drivers.epd_2in13_v2 import EPD2in13V2 as _EPD2in13V2
+        EPD2in13V2 = _EPD2in13V2
+    if INA3221 is None:
+        from lib.drivers.ina3221 import INA3221 as _INA3221
+        INA3221 = _INA3221
+    if draw_action_message is None or draw_status is None or draw_wifi_mode is None:
+        from lib.ui.status_screen import (
+            draw_action_message as _draw_action_message,
+            draw_status as _draw_status,
+            draw_wifi_mode as _draw_wifi_mode,
+        )
+        draw_action_message = _draw_action_message
+        draw_status = _draw_status
+        draw_wifi_mode = _draw_wifi_mode
+
+
 def _is_socket_timeout(exc):
     try:
         code = exc.args[0]
@@ -144,8 +169,6 @@ def _is_socket_timeout(exc):
 
 
 def _wake_interval_ms():
-    if _power_saver_mode:
-        return int(getattr(config, "POWER_SAVER_WAKE_INTERVAL_MS", 60 * 60 * 1000))
     return int(getattr(config, "STANDARD_WAKE_INTERVAL_MS", getattr(config, "WAKE_INTERVAL_MS", 10 * 60 * 1000)))
 
 
@@ -492,12 +515,19 @@ def _recover_config_from_backup_if_needed():
 
 def _ensure_config_defaults_loaded():
     missing = []
+    to_persist = {}
     for key, default in _REQUIRED_CONFIG_DEFAULTS.items():
         if not hasattr(config, key):
             setattr(config, key, default)
             missing.append(key)
+            to_persist[key] = repr(default)
     if missing:
         print("[WARN] Missing config keys at runtime; using defaults: {}".format(", ".join(missing)))
+        saved, count = _save_config_vars(to_persist)
+        if saved:
+            _dbg("Persisted {} missing config keys".format(count))
+        else:
+            _dbg("Could not persist missing config keys to config.py")
 
 
 def _load_config_vars():
@@ -522,16 +552,6 @@ def _load_config_vars():
     # Show newer web-editable defaults even if config.py is from an older build.
     for key in _REQUIRED_CONFIG_DEFAULTS:
         if _is_web_editable_config_key(key) and key not in vars_map:
-            vars_map[key] = repr(getattr(config, key))
-
-    for key in (
-        "CANOPY_SCHEDULE_ENABLED",
-        "CANOPY_OPEN_TIME_HM",
-        "CANOPY_CLOSE_TIME_HM",
-        "CANOPY_RAIN_OVERRIDE_ENABLED",
-        "CANOPY_RAIN_CLOSE_PCT",
-    ):
-        if key not in vars_map and hasattr(config, key):
             vars_map[key] = repr(getattr(config, key))
 
     return path, lines, vars_map
@@ -653,6 +673,55 @@ def _wifi_is_connected():
         return bool(wlan.active() and wlan.isconnected())
     except Exception:
         return False
+
+
+def _wifi_log_stack_info_once(wlan):
+    global _wifi_stack_info_logged
+    if _wifi_stack_info_logged:
+        return
+    _wifi_stack_info_logged = True
+
+    rel = "?"
+    machine_name = "?"
+    uname_fn = getattr(os, "uname", None)
+    if callable(uname_fn):
+        try:
+            u = uname_fn()
+            rel = getattr(u, "release", "?")
+            machine_name = getattr(u, "machine", "?")
+        except Exception:
+            pass
+
+    try:
+        mac_raw = wlan.config("mac")
+        mac = ":".join("{:02X}".format(b) for b in mac_raw)
+    except Exception:
+        mac = "?"
+
+    _dbg("Wi-Fi stack: {} | {} | MAC {}".format(rel, machine_name, mac))
+
+
+def _wifi_scan_best_bssid(wlan, ssid):
+    try:
+        aps = wlan.scan()
+    except Exception as exc:
+        _dbg("Wi-Fi scan failed: {}".format(exc))
+        return None, None, None
+
+    target = ssid.encode("utf-8")
+    best_bssid = None
+    best_rssi = -999
+    for ap_info in aps:
+        if len(ap_info) < 4:
+            continue
+        ap_ssid = ap_info[0]
+        ap_bssid = ap_info[1]
+        ap_rssi = ap_info[3]
+        if ap_ssid == target and ap_rssi > best_rssi:
+            best_bssid = ap_bssid
+            best_rssi = ap_rssi
+
+    return best_bssid, best_rssi, len(aps)
 
 
 def _read_button(pin):
@@ -827,65 +896,285 @@ def _resolve_refresh_mode(requested_mode):
     return requested_mode
 
 
-def _sleep_ms_with_poll(ms, pin_mode=None, pin_servo=None):
-    end = time.ticks_add(time.ticks_ms(), ms)
-    while time.ticks_diff(end, time.ticks_ms()) > 0:
-        time.sleep_ms(20)
-        # If either button stays pressed, just keep draining until released.
-        if pin_mode is not None and _read_button(pin_mode):
-            continue
-        if pin_servo is not None and _read_button(pin_servo):
-            continue
-
-
-def _wifi_connect(timeout_ms=None):
+def _wifi_connect(timeout_ms=None, attempts_override=None):
     if network is None:
         _dbg("network module unavailable")
         return None
 
-    ssid = getattr(config, "WIFI_SSID", "")
-    password = getattr(config, "WIFI_PASSWORD", "")
+    ssid = str(getattr(config, "WIFI_SSID", "")).strip()
+    password = str(getattr(config, "WIFI_PASSWORD", ""))
 
     if not ssid:
         _dbg("WIFI_SSID not set; skipping weather")
         return None
 
     wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
+    _wifi_log_stack_info_once(wlan)
 
-    if wlan.isconnected():
-        return wlan
+    # Optional regulatory hint; when empty, firmware default is retained.
+    country = str(getattr(config, "WIFI_COUNTRY", "")).strip().upper()
+    if len(country) == 2:
+        try:
+            import rp2  # noqa: F401
 
-    _dbg("Wi-Fi connect start: {}".format(ssid))
-    _web_log("Wi-Fi connect start: {}".format(ssid))
+            try:
+                rp2.country(country)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            network.country(country)
+        except Exception:
+            pass
+
+    # Prefer reliable association over power save while connecting.
+    pm_mode = str(getattr(config, "WIFI_PM_MODE", "none")).strip().lower()
     try:
-        wlan.connect(ssid, password)
-    except Exception as exc:
-        _dbg("Wi-Fi connect call failed: {}".format(exc))
-        _web_log("Wi-Fi connect call failed: {}".format(exc))
-        return None
+        if pm_mode == "none" and hasattr(network.WLAN, "PM_NONE"):
+            wlan.config(pm=network.WLAN.PM_NONE)
+        elif pm_mode == "performance" and hasattr(network.WLAN, "PM_PERFORMANCE"):
+            wlan.config(pm=network.WLAN.PM_PERFORMANCE)
+        elif pm_mode == "powersave" and hasattr(network.WLAN, "PM_POWERSAVE"):
+            wlan.config(pm=network.WLAN.PM_POWERSAVE)
+    except Exception:
+        pass
+
+    disable_ap = bool(getattr(config, "WIFI_DISABLE_AP_DURING_STA", False))
+    try:
+        ap = network.WLAN(network.AP_IF)
+        if ap.active() and disable_ap:
+            ap.active(False)
+            _dbg("Local AP disabled during STA connect")
+    except Exception:
+        pass
+
+    try:
+        wlan.active(True)
+    except Exception:
+        pass
+
+    # On RP2, default reconnect behavior can leave status stuck at CONNECTING forever.
+    try:
+        wlan.config(reconnects=0)
+    except Exception:
+        pass
 
     if timeout_ms is None:
         timeout_ms = int(getattr(config, "WIFI_CONNECT_TIMEOUT_MS", 30_000))
-    start = time.ticks_ms()
-    while not wlan.isconnected():
-        if time.ticks_diff(time.ticks_ms(), start) > timeout_ms:
-            _dbg("Wi-Fi connect timeout")
-            try:
-                st = wlan.status()
-            except Exception:
-                st = "?"
-            _web_log("Wi-Fi connect timeout; status={}".format(st))
-            return None
-        time.sleep_ms(200)
+    if timeout_ms < 5_000:
+        timeout_ms = 5_000
 
-    try:
-        ip = wlan.ifconfig()[0]
-    except Exception:
-        ip = "?"
-    _dbg("Wi-Fi connected, IP={}".format(ip))
-    _web_log("Wi-Fi connected, IP={}".format(ip))
-    return wlan
+    if attempts_override is None:
+        attempts = int(getattr(config, "WIFI_CONNECT_ATTEMPTS", 2))
+    else:
+        attempts = int(attempts_override)
+    if attempts < 1:
+        attempts = 1
+    elif attempts > 4:
+        attempts = 4
+
+    reset_ms = int(getattr(config, "WIFI_CONNECT_RESET_MS", 150))
+    if reset_ms < 0:
+        reset_ms = 0
+
+    retry_delay_ms = int(getattr(config, "WIFI_CONNECT_RETRY_DELAY_MS", 1_000))
+    if retry_delay_ms < 100:
+        retry_delay_ms = 100
+    elif retry_delay_ms > 10_000:
+        retry_delay_ms = 10_000
+
+    connecting_stuck_ms = int(getattr(config, "WIFI_CONNECTING_STUCK_MS", 8_000))
+    if connecting_stuck_ms < 1_000:
+        connecting_stuck_ms = 1_000
+    elif connecting_stuck_ms > timeout_ms:
+        connecting_stuck_ms = timeout_ms
+
+    stat_connecting = int(getattr(network, "STAT_CONNECTING", 1))
+    stat_wrong_pw = int(getattr(network, "STAT_WRONG_PASSWORD", -3))
+    stat_no_ap = int(getattr(network, "STAT_NO_AP_FOUND", -2))
+    stat_fail = int(getattr(network, "STAT_CONNECT_FAIL", -1))
+
+    status_names = {
+        stat_connecting: "CONNECTING",
+        stat_wrong_pw: "WRONG_PASSWORD",
+        stat_no_ap: "NO_AP_FOUND",
+        stat_fail: "CONNECT_FAIL",
+    }
+
+    diag_scan = bool(getattr(config, "WIFI_DIAG_SCAN_ON_STUCK", True))
+    use_scan_before_connect = bool(getattr(config, "WIFI_SCAN_BEFORE_CONNECT", True))
+    use_scanned_bssid = bool(getattr(config, "WIFI_USE_SCANNED_BSSID", True))
+
+    warmup_ms = int(getattr(config, "WIFI_RADIO_WARMUP_MS", 300))
+    if warmup_ms < 0:
+        warmup_ms = 0
+    elif warmup_ms > 5_000:
+        warmup_ms = 5_000
+
+    rescue_timeout_ms = int(getattr(config, "WIFI_RESCUE_CONNECT_TIMEOUT_MS", 5_000))
+    if rescue_timeout_ms < 1_000:
+        rescue_timeout_ms = 1_000
+    elif rescue_timeout_ms > timeout_ms:
+        rescue_timeout_ms = timeout_ms
+
+    for attempt in range(attempts):
+        # Hard-reset STA state between attempts to avoid sticky CONNECTING state.
+        if reset_ms:
+            try:
+                wlan.active(False)
+            except Exception:
+                pass
+            time.sleep_ms(reset_ms)
+            try:
+                wlan.active(True)
+            except Exception:
+                pass
+            if warmup_ms:
+                time.sleep_ms(warmup_ms)
+
+        try:
+            wlan.disconnect()
+        except Exception:
+            pass
+
+        if wlan.isconnected():
+            return wlan
+
+        connect_bssid = None
+        if use_scan_before_connect:
+            bssid, rssi, ap_count = _wifi_scan_best_bssid(wlan, ssid)
+            if ap_count is not None:
+                _dbg("Wi-Fi preflight scan APs: {}".format(ap_count))
+            if bssid is None:
+                _dbg("Wi-Fi AP not visible in preflight scan: {}".format(ssid))
+            else:
+                _dbg("Wi-Fi AP preflight RSSI={} dBm".format(rssi))
+                if use_scanned_bssid:
+                    connect_bssid = bssid
+
+        _dbg("Wi-Fi connect start: {} (attempt {}/{})".format(ssid, attempt + 1, attempts))
+        _web_log("Wi-Fi connect start: {}".format(ssid))
+        used_bssid = False
+        try:
+            if connect_bssid is not None:
+                try:
+                    wlan.connect(ssid, password, bssid=connect_bssid)
+                    used_bssid = True
+                except TypeError:
+                    wlan.connect(ssid, password)
+            else:
+                wlan.connect(ssid, password)
+        except Exception as exc:
+            _dbg("Wi-Fi connect call failed: {}".format(exc))
+            _web_log("Wi-Fi connect call failed: {}".format(exc))
+            if attempt + 1 < attempts:
+                time.sleep_ms(retry_delay_ms)
+            continue
+
+        start = time.ticks_ms()
+        last_status = None
+        while not wlan.isconnected():
+            elapsed = time.ticks_diff(time.ticks_ms(), start)
+            try:
+                status = wlan.status()
+                if status != last_status:
+                    label = status_names.get(status, str(status))
+                    _dbg("Wi-Fi status: {}".format(label))
+                    last_status = status
+                if status == stat_connecting and elapsed > connecting_stuck_ms:
+                    _dbg("Wi-Fi connect stuck; retrying")
+                    _web_log("Wi-Fi connect stuck; status={}".format(status))
+                    if diag_scan:
+                        try:
+                            aps = wlan.scan()
+                            _dbg("Wi-Fi diag scan APs: {}".format(len(aps)))
+                        except Exception as exc:
+                            _dbg("Wi-Fi diag scan failed: {}".format(exc))
+                    break
+                if status in (stat_wrong_pw, stat_no_ap, stat_fail):
+                    _dbg("Wi-Fi connect failed early; status={}".format(status))
+                    _web_log("Wi-Fi connect failed early; status={}".format(status))
+                    break
+            except Exception:
+                pass
+
+            if elapsed > timeout_ms:
+                _dbg("Wi-Fi connect timeout")
+                try:
+                    st = wlan.status()
+                except Exception:
+                    st = "?"
+                _web_log("Wi-Fi connect timeout; status={}".format(st))
+                break
+            try:
+                machine.idle()
+            except Exception:
+                pass
+            time.sleep_ms(50)
+
+        if wlan.isconnected():
+            try:
+                ip = wlan.ifconfig()[0]
+            except Exception:
+                ip = "?"
+            _dbg("Wi-Fi connected, IP={}".format(ip))
+            _web_log("Wi-Fi connected, IP={}".format(ip))
+            return wlan
+
+        # Rescue path: retry once with explicit BSSID if first connect did not use it.
+        if (not wlan.isconnected()) and (connect_bssid is not None) and (not used_bssid):
+            _dbg("Wi-Fi rescue connect via BSSID")
+            try:
+                wlan.disconnect()
+            except Exception:
+                pass
+            time.sleep_ms(100)
+            try:
+                wlan.connect(ssid, password, bssid=connect_bssid)
+            except TypeError:
+                wlan.connect(ssid, password)
+            except Exception as exc:
+                _dbg("Wi-Fi rescue connect call failed: {}".format(exc))
+
+            rescue_start = time.ticks_ms()
+            while not wlan.isconnected():
+                rescue_elapsed = time.ticks_diff(time.ticks_ms(), rescue_start)
+                try:
+                    status = wlan.status()
+                    if status in (stat_wrong_pw, stat_no_ap, stat_fail):
+                        _dbg("Wi-Fi rescue failed early; status={}".format(status))
+                        break
+                except Exception:
+                    pass
+
+                if rescue_elapsed > rescue_timeout_ms:
+                    _dbg("Wi-Fi rescue timeout")
+                    break
+
+                try:
+                    machine.idle()
+                except Exception:
+                    pass
+                time.sleep_ms(50)
+
+            if wlan.isconnected():
+                try:
+                    ip = wlan.ifconfig()[0]
+                except Exception:
+                    ip = "?"
+                _dbg("Wi-Fi connected (rescue), IP={}".format(ip))
+                _web_log("Wi-Fi connected, IP={}".format(ip))
+                return wlan
+
+        try:
+            wlan.disconnect()
+        except Exception:
+            pass
+        if attempt + 1 < attempts:
+            time.sleep_ms(retry_delay_ms)
+    return None
 
 
 def _wifi_start_ap():
@@ -1066,120 +1355,14 @@ def _http_send_start(client, status, content_type):
     )
 
 
-def _render_web_index(message=""):
-    _path, _lines, vars_map = _load_config_vars()
-    keys = sorted(vars_map.keys())
-
-    sections = {
-        "Network": [],
-        "Weather": [],
-        "Time": [],
-        "Logging": [],
-        "Power + Wake": [],
-        "Sensors + Sampling": [],
-        "Servo": [],
-        "System": [],
-    }
-
-    def _section_for_key(key):
-        if key.startswith("WIFI_") or key.startswith("WEB_UI_"):
-            return "Network"
-        if key.startswith("WEATHER_") or key == "ENABLE_WEATHER":
-            return "Weather"
-        if key in ("ENABLE_WEB_TIME_SYNC", "NTP_HOST", "TIMEZONE_OFFSET_HOURS"):
-            return "Time"
-        if key.startswith("LOG_"):
-            return "Logging"
-        if "WAKE" in key or "SLEEP" in key or key.startswith("BUTTON_") or key in ("ENABLE_LOW_POWER_SLEEP", "ENABLE_BUTTON_WAKE"):
-            return "Power + Wake"
-        if key.startswith("BME_") or key.startswith("INA_") or key.startswith("I2C_") or key.startswith("SENSOR_"):
-            return "Sensors + Sampling"
-        if key.startswith("CANOPY_"):
-            return "Servo"
-        if key.startswith("SERVO_"):
-            return "Servo"
-        return "System"
-
-    for key in keys:
-        sections[_section_for_key(key)].append(key)
-
-    section_html = []
-    for name in ("Network", "Weather", "Time", "Logging", "Power + Wake", "Sensors + Sampling", "Servo", "System"):
-        sec_keys = sections[name]
-        if not sec_keys:
-            continue
-        rows = []
-        for key in sorted(sec_keys):
-            rows.append(
-                "<div class=\"row\">"
-                "<label for=\"{}\">{}</label>"
-                "<input id=\"{}\" name=\"{}\" value=\"{}\"/>"
-                "</div>".format(
-                    _html_escape(key),
-                    _html_escape(key),
-                    _html_escape(key),
-                    _html_escape(key),
-                    _html_escape(vars_map[key]),
-                )
-            )
-        section_html.append(
-            "<section><h2>{}</h2><div class=\"rows\">{}</div></section>".format(
-                _html_escape(name),
-                "".join(rows),
-            )
-        )
-
-    info = ""
-    if _log_path:
-        info = "<div class=\"info\">Active log: {}</div>".format(_html_escape(_log_path))
-
-    msg_html = ""
-    if message:
-        msg_html = "<div class=\"msg\">{}</div>".format(_html_escape(message))
-
-    return (
-        "<html><head><title>BiomeLX</title>"
-        "<style>"
-        "body{{margin:0;padding:20px;background:#f5f7f8;color:#1f2933;font:14px/1.4 'Segoe UI',Tahoma,sans-serif;}}"
-        ".wrap{{max-width:860px;margin:0 auto;background:#fff;border:1px solid #d9e2ec;border-radius:10px;padding:20px 22px;}}"
-        "h1{{margin:0 0 12px;font-size:24px;}}"
-        "h2{{margin:0 0 10px;font-size:16px;color:#334e68;}}"
-        "section{{padding:14px 0;border-top:1px solid #e4e7eb;}}"
-        "section:first-of-type{{border-top:0;padding-top:4px;}}"
-        ".rows{{display:block;}}"
-        ".row{{display:flex;align-items:center;gap:14px;margin:8px 0;}}"
-        "label{{width:290px;min-width:290px;color:#243b53;font-weight:600;}}"
-        "input{{flex:1;min-width:0;padding:8px 10px;border:1px solid #bcccdc;border-radius:6px;background:#fff;}}"
-        "input:focus{{outline:none;border-color:#486581;box-shadow:0 0 0 2px #d9e2ec;}}"
-        ".msg{{margin:10px 0 12px;padding:10px 12px;border:1px solid #bcd7f7;background:#eff6ff;border-radius:6px;color:#1e429f;}}"
-        ".info{{margin:10px 0 14px;padding:10px 12px;border:1px solid #d9e2ec;background:#f8fbfd;border-radius:6px;color:#486581;}}"
-        ".actions{{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid #e4e7eb;}}"
-        "button,a.btn{{padding:9px 14px;border-radius:6px;border:1px solid #829ab1;background:#334e68;color:#fff;text-decoration:none;cursor:pointer;font-weight:600;}}"
-        "button.secondary,a.btn.secondary{{background:#fff;color:#334e68;}}"
-        "button.danger{{background:#8b1e3f;border-color:#8b1e3f;}}"
-        "@media (max-width:760px){{label{{width:100%;min-width:0}}.row{{display:block}}.row input{{width:100%;box-sizing:border-box;margin-top:6px}}}}"
-        "</style></head><body><div class=\"wrap\">"
-        "<h1>BiomeLX Web UI</h1>"
-        "{}{}"
-        "<form method=\"POST\" action=\"/save\">{}"
-        "<div class=\"actions\">"
-        "<button type=\"submit\">Save Config</button>"
-        "<a class=\"btn secondary\" href=\"/logs\">Download Logs</a>"
-        "</div></form>"
-        "<form method=\"POST\" action=\"/reset\" style=\"margin-top:10px\">"
-        "<button class=\"danger\" type=\"submit\">Hard Reset</button>"
-        "</form>"
-        "</div></body></html>"
-    ).format(msg_html, info, "".join(section_html))
-
-
 def _send_web_index(client, message=""):
     # Stream HTML in small chunks to avoid large heap allocations.
     _path, _lines, vars_map = _load_config_vars()
-    keys = sorted(vars_map.keys())
+    keys = tuple(vars_map.keys())
 
     sections = {
         "Network": [],
+        "Canopy + Rain": [],
         "Weather": [],
         "Time": [],
         "Logging": [],
@@ -1191,7 +1374,25 @@ def _send_web_index(client, message=""):
 
     def _section_for_key(key):
         if key.startswith("WIFI_") or key.startswith("WEB_UI_"):
+            if key not in (
+                "WIFI_SSID",
+                "WIFI_PASSWORD",
+                "WIFI_AP_SSID",
+                "WIFI_AP_PASSWORD",
+                "WEB_UI_PORT",
+                "WEB_UI_ALT_PORT",
+            ):
+                return None
             return "Network"
+        if key in (
+            "CANOPY_SCHEDULE_ENABLED",
+            "CANOPY_OPEN_TIME_HM",
+            "CANOPY_CLOSE_TIME_HM",
+            "CANOPY_RAIN_OVERRIDE_ENABLED",
+            "CANOPY_RAIN_CLOSE_PCT",
+            "WEATHER_RAIN_SOON_HOURS",
+        ):
+            return "Canopy + Rain"
         if key.startswith("WEATHER_") or key == "ENABLE_WEATHER":
             return "Weather"
         if key in ("ENABLE_WEB_TIME_SYNC", "NTP_HOST", "TIMEZONE_OFFSET_HOURS"):
@@ -1207,7 +1408,9 @@ def _send_web_index(client, message=""):
         return "System"
 
     for key in keys:
-        sections[_section_for_key(key)].append(key)
+        section_name = _section_for_key(key)
+        if section_name:
+            sections[section_name].append(key)
 
     _http_send_start(client, "200 OK", "text/html; charset=utf-8")
     _socket_send_all(
@@ -1234,12 +1437,12 @@ def _send_web_index(client, message=""):
         _socket_send_all(client, "<p>Active log: {}</p>".format(_html_escape(_log_path)))
 
     _socket_send_all(client, "<form method=\"POST\" action=\"/save\">")
-    for name in ("Network", "Weather", "Time", "Logging", "Power + Wake", "Sensors + Sampling", "Servo", "System"):
+    for name in ("Network", "Canopy + Rain", "Weather", "Time", "Logging", "Power + Wake", "Sensors + Sampling", "Servo", "System"):
         sec_keys = sections[name]
         if not sec_keys:
             continue
         _socket_send_all(client, "<fieldset><legend>{}</legend>".format(_html_escape(name)))
-        for key in sorted(sec_keys):
+        for key in sec_keys:
             _socket_send_all(
                 client,
                 "<div class=\"row\"><label for=\"{k}\">{k}</label>"
@@ -1540,6 +1743,8 @@ def _is_rain_code(weather_code):
 
 
 def _read_weather():
+    global _wifi_last_fail_ms
+
     if not getattr(config, "ENABLE_WEATHER", True):
         _dbg("weather disabled in config")
         return None
@@ -1560,21 +1765,44 @@ def _read_weather():
     if connect_retries > 4:
         connect_retries = 4
 
+    pull_timeout_ms = int(getattr(config, "WIFI_PULL_CONNECT_TIMEOUT_MS", 12_000))
+    if pull_timeout_ms < 3_000:
+        pull_timeout_ms = 3_000
+
+    pull_attempts = int(getattr(config, "WIFI_PULL_CONNECT_ATTEMPTS", 1))
+    if pull_attempts < 1:
+        pull_attempts = 1
+    elif pull_attempts > 3:
+        pull_attempts = 3
+
+    fail_cooldown_ms = int(getattr(config, "WIFI_PULL_FAIL_COOLDOWN_MS", 120_000))
+    if fail_cooldown_ms < 0:
+        fail_cooldown_ms = 0
+
+    if _wifi_last_fail_ms is not None and fail_cooldown_ms > 0:
+        since_fail = time.ticks_diff(time.ticks_ms(), _wifi_last_fail_ms)
+        if since_fail >= 0 and since_fail < fail_cooldown_ms:
+            _dbg("weather skipped: Wi-Fi cooldown active")
+            return None
+
     if (not _wireless_mode) and bool(getattr(config, "WIFI_PULL_RESET_RADIO", True)):
         _wifi_disable_all()
         time.sleep_ms(200)
 
     wlan = None
     for attempt in range(connect_retries):
-        wlan = _wifi_connect()
+        wlan = _wifi_connect(timeout_ms=pull_timeout_ms, attempts_override=pull_attempts)
         if wlan is not None:
             break
         _dbg("weather Wi-Fi connect retry {}/{}".format(attempt + 1, connect_retries))
         time.sleep_ms(300)
 
     if wlan is None:
+        _wifi_last_fail_ms = time.ticks_ms()
         _dbg("weather skipped: Wi-Fi unavailable")
         return None
+
+    _wifi_last_fail_ms = None
     _sync_time_from_web()
 
     rain_soon_hours = int(getattr(config, "WEATHER_RAIN_SOON_HOURS", 3))
@@ -2079,8 +2307,9 @@ def _draw_wireless_status(epd):
 
 
 def run_once():
-    global _power_saver_mode, _canopy_open, _swallow_wake_button_press, _last_wake_reason, _wireless_mode
+    global _canopy_open, _swallow_wake_button_press, _last_wake_reason, _wireless_mode
 
+    _lazy_import_runtime_modules()
     _dbg("run_once start")
     _recover_config_from_backup_if_needed()
     _ensure_config_defaults_loaded()
@@ -2098,6 +2327,7 @@ def run_once():
         bme_i2c_freq,
         prefer_soft=bool(getattr(config, "BME_PREFER_SOFT_I2C", False)),
     )
+
 
     ina_i2c_id = getattr(config, "INA_I2C_ID", 0)
     ina_i2c_scl = getattr(config, "INA_I2C_PIN_SCL", 1)
@@ -2202,6 +2432,7 @@ def run_once():
         solar_a,
     ) = _sample_averaged_readings(internal_bme, external_bme, ina)
 
+
     # Keep pre-remap BME sample if averaging failed to yield valid values.
     if in_t is None:
         in_t = pre_in_t
@@ -2254,6 +2485,7 @@ def run_once():
     _set_canopy_state(servo, desired_open, force=True, motion_mode="simple")
     canopy_state = "open" if _canopy_open else "closed"
 
+
     payload = {
         "state": canopy_state,
         "in_t_c": in_t,
@@ -2274,7 +2506,7 @@ def run_once():
         "weather_phase": _weather_phase_label(),
         "wifi_connected": _wifi_is_connected(),
         "wifi_mode": _wireless_mode,
-        "power_saver": _power_saver_mode,
+        "power_saver": (not _wireless_mode),
     }
 
     _append_log_row(payload)

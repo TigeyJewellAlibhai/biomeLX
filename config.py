@@ -1,7 +1,7 @@
 """Hardware and firmware configuration for BiomeLX."""
 
 # Set True while diagnosing startup/freezes to keep board responsive in REPL.
-DEBUG_MODE = False
+DEBUG_MODE = True
 
 # In debug mode, do not enter deep sleep after each cycle.
 ENABLE_LOW_POWER_SLEEP = True
@@ -128,6 +128,22 @@ ENABLE_WEATHER = True
 WIFI_SSID = "LordOfThePings-2.4GHz"
 WIFI_PASSWORD = "Theeaglesarecoming"
 WIFI_CONNECT_TIMEOUT_MS = 30_000
+WIFI_CONNECT_ATTEMPTS = 3
+WIFI_CONNECT_RESET_MS = 150
+WIFI_CONNECT_RETRY_DELAY_MS = 1_000
+WIFI_CONNECTING_STUCK_MS = 8_000
+WIFI_RADIO_WARMUP_MS = 300
+WIFI_RESCUE_CONNECT_TIMEOUT_MS = 5_000
+# Optional 2-letter regulatory domain (blank keeps firmware default).
+WIFI_COUNTRY = ""
+# "none", "performance", or "powersave".
+WIFI_PM_MODE = "none"
+# Set True only if you want STA connect to force local AP_IF off.
+WIFI_DISABLE_AP_DURING_STA = False
+# Run a diagnostic scan when connect is stuck to show nearby AP count.
+WIFI_DIAG_SCAN_ON_STUCK = True
+WIFI_SCAN_BEFORE_CONNECT = True
+WIFI_USE_SCANNED_BSSID = True
 
 # AP fallback used when station connection fails in wireless mode.
 WIFI_AP_SSID = "BiomeLX-Setup"
@@ -164,8 +180,11 @@ WEATHER_RAIN_SOON_HOURS = 3
 # Weather API endpoint and reliability knobs for constrained network stacks.
 WEATHER_API_BASE_URL = "https://api.open-meteo.com/v1/forecast"
 WEATHER_ALLOW_HTTP_FALLBACK = True
-WIFI_PULL_CONNECT_RETRIES = 2
-WIFI_PULL_RESET_RADIO = True
+WIFI_PULL_CONNECT_RETRIES = 1
+WIFI_PULL_CONNECT_ATTEMPTS = 1
+WIFI_PULL_CONNECT_TIMEOUT_MS = 12_000
+WIFI_PULL_RESET_RADIO = False
+WIFI_PULL_FAIL_COOLDOWN_MS = 120_000
 
 # Sensor sampling: collect readings for this duration on wake, then average.
 SENSOR_SAMPLE_WINDOW_MS = 1_000
